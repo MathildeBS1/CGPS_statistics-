@@ -23,8 +23,9 @@ Counts may still be combined across different tables, so have the output checked
 data agreement before taking it out of the secure environment.
 
 Coding assumptions, to check against the value counts in the report: yes/no fields are 1/0 (or
-yes/no, ja/nej) and any value > 0 counts as yes; stenosis grades are ordinal numbers; a plaque
-type in ``NO_PLAQUE`` means no plaque.
+yes/no, ja/nej) and any value > 0 counts as yes. Segment stenosis and plaque type are text labels
+decoded with STENOSIS_CODES / PLAQUE_CODES (section 5 counts any label that was not recognised);
+plaque is present when stenosis is minimal or worse.
 """
 
 from __future__ import annotations
@@ -52,6 +53,24 @@ MAX_LEVELS = (
     20  # value counts are reported for columns with at most this many distinct values
 )
 NO_PLAQUE = (0,)
+# segment stenosis and plaque type are stored as text labels; "uneval_*" stenosis = not evaluable
+STENOSIS_CODES = {
+    "none": 0,
+    "minimal": 1,
+    "mild": 2,
+    "moderate": 3,
+    "severe": 4,
+    "occlusion": 5,
+}
+PLAQUE_CODES = {
+    "calcified": 1,
+    "mostly_calcified": 2,
+    "mostly_noncalcified": 3,
+    "noncalcified": 4,
+}
+TYPE_NOT_RECORDED = (
+    9  # plaque present (stenosis minimal or worse) but no plaque type given
+)
 SEGMENTS = (
     "lm",
     "plad",
@@ -186,7 +205,7 @@ QUALITY_FU = (
     "ct_angio_heart_done",
     "ct_noncontrast_heart_done",
 )
-OBSTRUCTIVE_GRADE = 3  # stenosis grade counted as obstructive; 3 = moderate (50-69%) if graded 0 none .. 5 occlusion
+OBSTRUCTIVE_GRADE = 3  # moderate (STENOSIS_CODES) or worse counts as obstructive
 LEVELS = {  # anatomical units, from single segments up to the whole tree. IM (ramus) is in no vessel.
     "segment": {s: (s,) for s in SEGMENTS},
     "position": {
@@ -439,6 +458,52 @@ def load(path):
         raise SystemExit(f"unsupported file type: {path}")
     df.columns = [str(c).strip() for c in df.columns]
     return df.replace(r"^\s*$", np.nan, regex=True)
+
+
+def label(s):
+    return s.astype(str).str.strip().str.lower().str.replace(r"[\s-]+", "_", regex=True)
+
+
+def decode_segments(df):
+    """Segment stenosis/plaque-type text labels -> numeric codes (numbers already present are kept).
+    Plaque type becomes 0 (no plaque) where stenosis is none, and TYPE_NOT_RECORDED where there is
+    plaque without a type. Returns the decoded table and counts per column (no labels)."""
+    df = df.copy()
+    counts = {}
+    for s in SEGMENTS:
+        sc, pc = f"ct_cag_{s}_stenosis", f"ct_cag_{s}_plaque_type"
+        if sc in df:
+            raw, text = df[sc], label(df[sc])
+            codes = text.map(STENOSIS_CODES).fillna(num(raw))
+            uneval = raw.notna() & text.str.startswith("uneval")
+            counts[sc] = {
+                "recognised": count(codes.notna().sum()),
+                "unevaluable (uneval_*)": count(uneval.sum()),
+                "unrecognised label": count(
+                    (raw.notna() & codes.isna() & ~uneval).sum()
+                ),
+                "empty": count(raw.isna().sum()),
+            }
+            df[sc] = codes
+        if pc in df:
+            raw = df[pc]
+            codes = label(raw).map(PLAQUE_CODES).fillna(num(raw))
+            unrecognised = raw.notna() & codes.isna()
+            if sc in df:
+                codes = codes.mask(df[sc] == 0, 0).mask(
+                    codes.isna() & ~unrecognised & (df[sc] >= 1), TYPE_NOT_RECORDED
+                )
+            counts[pc] = {
+                "recognised": count((raw.notna() & ~unrecognised).sum()),
+                "unrecognised label": count(unrecognised.sum()),
+                "set to no plaque (stenosis none)": count(
+                    (raw.isna() & (codes == 0)).sum()
+                ),
+                "plaque, type not recorded": count((codes == TYPE_NOT_RECORDED).sum()),
+                "empty": count(codes.isna().sum()),
+            }
+            df[pc] = codes
+    return df, counts
 
 
 def col(df, name):
@@ -1187,7 +1252,7 @@ def categories(B, F, binary):
     t = crosstab(wb, wf, allow_text=True)
     return {
         "worst stenosis category BL -> FU (highest flag set)": {
-            r: t[r] for r in order if r in t
+            r: {c: t[r].get(c, 0) for c in order} for r in order if r in t
         },
         "obstructive (moderate+) at BL": frac(ob),
         "obstructive at FU": frac(of),
@@ -1260,14 +1325,35 @@ def lipid_change(B, F):
     return pd.Series(labels, index=B.index)
 
 
-def stratified(strata, cont, binary):
+def stratified(strata, cont, binary, B, years):
+    """Outcomes per group, plus what differs between the groups at BL (follow-up time, risk factors,
+    which variables were collected) - a group difference in outcome may come from these."""
+    missing_cols = [
+        c
+        for c in PREDICTORS + EVENT_COLS + tuple(f"ct_cag_{c}" for c in CATEGORIES)
+        if c in B
+    ]
     out = {}
     for sname, groups in strata.items():
         if groups is None:
             continue
         groups = groups.map(key)
+        gs = sorted(groups.unique(), key=order)
         out[sname] = {
             "group sizes": levels(groups, allow_text=True),
+            "follow-up years": {g: describe(years[groups == g]) for g in gs},
+            "BL predictor mean": {
+                p: {g: describe(num(B[p])[groups == g]).get("mean") for g in gs}
+                for p in PREDICTORS
+                if p in B
+            },
+            "% missing at BL (were variables collected in every group?)": {
+                c: {
+                    g: pct(B[c][groups == g].isna().sum(), (groups == g).sum())
+                    for g in gs
+                }
+                for c in missing_cols
+            },
             "binary outcomes (% events)": {
                 o: {g: frac(y[groups == g])["pct"] for g in sorted(groups.unique())}
                 for o, y in binary.items()
@@ -1327,6 +1413,10 @@ def feasibility(binary, cont, B):
     complete = (
         B[present].notna().all(axis=1) if present else pd.Series(False, index=B.index)
     )
+    usable = [p for p in present if B[p].isna().mean() < 0.2]
+    complete_usable = (
+        B[usable].notna().all(axis=1) if usable else pd.Series(False, index=B.index)
+    )
     return {
         "binary outcomes": rows,
         "continuous outcomes (n available)": {
@@ -1337,6 +1427,13 @@ def feasibility(binary, cont, B):
             "predictors absent": ", ".join(p for p in PREDICTORS if p not in B)
             or "none",
             "complete cases on all present predictors": count(complete.sum()),
+            "predictors with >= 20% missing": ", ".join(
+                p for p in present if p not in usable
+            )
+            or "none",
+            "complete cases on predictors with < 20% missing": count(
+                complete_usable.sum()
+            ),
             "missing per predictor": {
                 p: count_of(B[p].isna().sum(), len(B)) for p in present
             },
@@ -1460,7 +1557,10 @@ def main():
             )
     dayfirst = not args.monthfirst
 
-    bl_raw, fu_raw = load(args.bl), load(args.fu)
+    (bl_raw, decoded_bl), (fu_raw, decoded_fu) = (
+        decode_segments(load(args.bl)),
+        decode_segments(load(args.fu)),
+    )
     for name, df in (("BL", bl_raw), ("FU", fu_raw)):
         if "study_id" not in df:
             raise SystemExit(f"{name} file has no study_id column")
@@ -1489,9 +1589,11 @@ def main():
         "4. Segment involvement / stenosis / plaque-type scores": scores(
             B, F, years, cont, binary
         ),
-        "5. Segment-level stenosis, plaque and high-risk features": segments(
-            B, F, cont, binary
-        ),
+        "5. Segment-level stenosis, plaque and high-risk features": {
+            "text labels decoded (BL)": decoded_bl,
+            "text labels decoded (FU)": decoded_fu,
+            **segments(B, F, cont, binary),
+        },
         "6. Plaque trajectory groups (none->none, none->plaque, plaque->same/more/less)": plaque_trajectories(
             B, F, binary
         ),
@@ -1511,7 +1613,7 @@ def main():
         binary, cont, B
     )
     sections["11. Outcomes by randomisation group, lipid-lowering change and sex"] = (
-        stratified(strata, cont, binary)
+        stratified(strata, cont, binary, B, years)
     )
     sections["12. Baseline predictor vs outcome associations"] = associations(
         B, cont, binary
