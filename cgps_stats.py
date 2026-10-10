@@ -11,11 +11,16 @@ the column names of header_BL.xlsx / header_FU.xlsx. Patients are paired on ``st
 Privacy: the script only reads the two input files and only writes aggregate statistics to
 ``--out``: report.md, stats.json, columns_bl.csv and columns_fu.csv. Nothing else is written (no
 cache, pickle or temp file) and the inputs are never modified or copied. It never writes study_id,
-any row-level value, free text or exact dates (dates are reduced to years and intervals). Counts
-from 1 to MIN_CELL-1, and summaries of fewer than MIN_CELL values, are written as "<MIN_CELL".
-Minimum and maximum are never reported, only the 5th-95th percentiles. Suppression is per cell, so
-a hidden cell can sometimes be recovered from a row total; check the output against your data
-agreement before taking it out of the secure environment.
+any row-level value, any text value (free text, initials, labels; only numeric codes are listed)
+or exact dates (dates are reduced to years and intervals). Disclosure control:
+- counts from 1 to MIN_CELL-1 are written as "<MIN_CELL", and summaries need MIN_CELL values;
+- "k of n" is also hidden when n - k is from 1 to MIN_CELL-1 (it could be worked out), or when
+  k = n in a group smaller than GROUP_MIN ("all of them" says something about each one);
+- in value counts and cross-tables no row or column keeps a single hidden cell, so it cannot be
+  recovered from the total (secondary suppression, shown as "hidden");
+- median/quartiles need QUARTILE_MIN values and 5th/95th percentiles TAIL_MIN; never min/max.
+Counts may still be combined across different tables, so have the output checked against your
+data agreement before taking it out of the secure environment.
 
 Coding assumptions, to check against the value counts in the report: yes/no fields are 1/0 (or
 yes/no, ja/nej) and any value > 0 counts as yes; stenosis grades are ordinal numbers; a plaque
@@ -40,6 +45,9 @@ OUT_DIR = (
 )
 
 MIN_CELL = 5
+QUARTILE_MIN = 10  # values needed before median/quartiles are shown
+TAIL_MIN = 20  # values needed before 5th/95th percentiles are shown
+GROUP_MIN = 20  # in smaller groups "all of them" (k = n) is hidden, as it tells something about each one
 MAX_LEVELS = (
     20  # value counts are reported for columns with at most this many distinct values
 )
@@ -232,24 +240,70 @@ KEY_CONTINUOUS = (
 
 # ---------------------------------------------------------------- disclosure-safe primitives
 
+SMALL = f"<{MIN_CELL}"  # a count from 1 to MIN_CELL-1
+HIDDEN = "hidden"  # a larger count hidden so that a small one cannot be worked out from a total
+
+
+def small(k):
+    return 0 < k < MIN_CELL
+
 
 def count(n):
     n = int(n)
-    return n if n == 0 or n >= MIN_CELL else f"<{MIN_CELL}"
+    return SMALL if small(n) else n
+
+
+def disclosive(k, n):
+    """k out of n reveals too much: the rest (n - k) is small, or all of a small group."""
+    return small(n - k) or (k == n and 0 < n < GROUP_MIN)
+
+
+def count_of(k, n):
+    k, n = int(k), int(n)
+    return SMALL if small(k) else HIDDEN if disclosive(k, n) else k
 
 
 def pct(k, n):
     k, n = int(k), int(n)
     if n == 0:
         return None
-    return round(100 * k / n, 1) if k == 0 or k >= MIN_CELL else f"<{MIN_CELL}"
+    return SMALL if small(k) else HIDDEN if disclosive(k, n) else round(100 * k / n, 1)
 
 
 def frac(flag):
     """Events among non-missing values of a 0/1 series."""
     valid = flag.dropna()
     k, n = int(valid.sum()), len(valid)
-    return {"n": count(n), "events": count(k), "pct": pct(k, n)}
+    return {"n": count(n), "events": count_of(k, n), "pct": pct(k, n)}
+
+
+def suppress(t):
+    """Counts table -> displayed values. Small cells become SMALL; then, while any row or column
+    has exactly one hidden cell (recoverable from its total), its smallest other non-zero cell
+    is hidden too."""
+    t = np.asarray(t, dtype=int)
+    primary = (t > 0) & (t < MIN_CELL)
+    hide = primary.copy()
+    lines = [np.s_[i, :] for i in range(t.shape[0])] + [
+        np.s_[:, j] for j in range(t.shape[1])
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for line in lines:
+            h, v = hide[line], t[line]
+            others = np.where(~h & (v > 0))[0]
+            if h.sum() == 1 and len(others):
+                h[others[np.argmin(v[others])]] = True  # h is a view into hide
+                changed = True
+    out = t.astype(object)
+    out[primary] = SMALL
+    out[hide & ~primary] = HIDDEN
+    return out
+
+
+def has_text(s):
+    return bool((s.notna() & num(s).isna()).any())
 
 
 def key(v):
@@ -270,8 +324,11 @@ def order(k):
     return (2 if k == "missing" else 1, 0.0, k)
 
 
-def levels(s):
-    """Value counts. Not listed for many distinct values, as the labels would be individual values."""
+def levels(s, allow_text=False):
+    """Value counts. Not listed for text values (unless they are this script's own labels) or many
+    distinct values, as the labels themselves could identify someone."""
+    if not allow_text and has_text(s):
+        return {"(text values, not listed)": count(s.notna().sum())}
     if s.nunique() > MAX_LEVELS:
         return {
             f"(more than {MAX_LEVELS} distinct values, not listed)": count(
@@ -279,36 +336,41 @@ def levels(s):
             )
         }
     vc = s.map(key).value_counts()
-    return {k: count(vc[k]) for k in sorted(vc.index, key=order)}
+    labels = sorted(vc.index, key=order)
+    return dict(zip(labels, suppress([[vc[k] for k in labels]])[0]))
 
 
-def crosstab(a, b):
+def crosstab(a, b, allow_text=False):
     """BL value (rows) x FU value (columns)."""
+    n = count((a.notna() & b.notna()).sum())
+    if not allow_text and (has_text(a) or has_text(b)):
+        return {"(text values, not tabulated)": {"n": n}}
     if a.nunique() > MAX_LEVELS or b.nunique() > MAX_LEVELS:
-        return {
-            f"(more than {MAX_LEVELS} distinct values, not tabulated)": {
-                "n": count((a.notna() & b.notna()).sum())
-            }
-        }
+        return {f"(more than {MAX_LEVELS} distinct values, not tabulated)": {"n": n}}
     t = pd.crosstab(a.map(key), b.map(key))
     rows, cols = sorted(t.index, key=order), sorted(t.columns, key=order)
-    return {r: {c: count(t.loc[r, c]) for c in cols} for r in rows}
+    shown = suppress(t.loc[rows, cols].to_numpy())
+    return {r: dict(zip(cols, shown[i])) for i, r in enumerate(rows)}
 
 
 def describe(x):
+    """Mean/SD from MIN_CELL values, quartiles from QUARTILE_MIN, 5th/95th percentiles from TAIL_MIN
+    (in small groups these lie close to single patients' values). Never min/max."""
     x = num(x).dropna()
-    if len(x) < MIN_CELL:
-        return {"n": count(len(x))}
+    n = len(x)
+    if n < MIN_CELL:
+        return {"n": count(n)}
     q = x.quantile([0.05, 0.25, 0.5, 0.75, 0.95])
+    quart, tail = n >= QUARTILE_MIN, n >= TAIL_MIN
     return {
-        "n": len(x),
+        "n": n,
         "mean": x.mean(),
         "sd": x.std(),
-        "p5": q[0.05],
-        "p25": q[0.25],
-        "median": q[0.5],
-        "p75": q[0.75],
-        "p95": q[0.95],
+        "p5": q[0.05] if tail else None,
+        "p25": q[0.25] if quart else None,
+        "median": q[0.5] if quart else None,
+        "p75": q[0.75] if quart else None,
+        "p95": q[0.95] if tail else None,
     }
 
 
@@ -316,7 +378,7 @@ def describe(x):
 
 
 def num(s):
-    if s.dtype == object:
+    if not pd.api.types.is_numeric_dtype(s):
         s = s.astype(str).str.strip().str.replace(",", ".", regex=False)
     return pd.to_numeric(s, errors="coerce")
 
@@ -393,8 +455,8 @@ def column_summary(df, dayfirst):
         n_missing = int(s.isna().sum())
         row = {
             "column": c,
-            "n_nonmissing": count(len(s) - n_missing),
-            "n_missing": count(n_missing),
+            "n_nonmissing": count_of(len(s) - n_missing, len(s)),
+            "n_missing": count_of(n_missing, len(s)),
             "pct_missing": pct(n_missing, len(s)),
         }
         if c == "study_id":
@@ -469,6 +531,7 @@ def cac(B, F, years, cont, binary):
             [-0.1, 0, 10, 100, 400, np.inf],
             labels=["0", "1-10", "11-100", "101-400", ">400"],
         ).astype(object),
+        allow_text=True,
     )
     if "ct_cacs_groups" in B and "ct_cacs_groups" in F:
         out["ct_cacs_groups BL -> FU"] = crosstab(
@@ -686,7 +749,7 @@ def trajectory(b, f, has_b=None, has_f=None):
 def group_sizes(t):
     n = int((t != "missing").sum())
     out = {
-        g: {"n": count((t == g).sum()), "pct": pct((t == g).sum(), n)}
+        g: {"n": count_of((t == g).sum(), n), "pct": pct((t == g).sum(), n)}
         for g in TRAJECTORIES
     }
     out["missing"] = {"n": count((t == "missing").sum()), "pct": None}
@@ -917,7 +980,7 @@ def cell(y):
     v = y.dropna()
     k, n = int(v.sum()), len(v)
     p = pct(k, n)
-    return f"{count(k)}/{count(n)}" + (f" ({p}%)" if isinstance(p, float) else "")
+    return f"{count_of(k, n)}/{count(n)}" + (f" ({p}%)" if isinstance(p, float) else "")
 
 
 def by_patient(x, index):
@@ -953,17 +1016,18 @@ def level_stats(units, long, B, F, years, tree):
         v, r = P[o].dropna(), R[o].dropna()
         k, n, rk = int(v.sum()), len(v), int(r.sum())
         ic = icc(P[o]) if multi else None
+        n_pat = v.index.get_level_values(-1).nunique()
         summary[o] = {
             "n units": count(n),
-            "events": count(k),
+            "events": count_of(k, n),
             "pct": pct(k, n),
-            "regression events": count(rk),
+            "regression events": count_of(rk, len(r)),
             "regression pct": pct(rk, len(r)),
             "progression : regression": round(k / rk, 2)
             if min(k, rk) >= MIN_CELL
             else None,
-            "patients with event": count(
-                v[v == 1].index.get_level_values(-1).nunique()
+            "patients with event": count_of(
+                v[v == 1].index.get_level_values(-1).nunique(), n_pat
             ),
             "ICC within patient": ic,
             "design effect": 1
@@ -1120,7 +1184,7 @@ def categories(B, F, binary):
     binary["worst_category_worsened"] = flag(
         wf.map(rank) > wb.map(rank), wb.notna() & wf.notna()
     )
-    t = crosstab(wb, wf)
+    t = crosstab(wb, wf, allow_text=True)
     return {
         "worst stenosis category BL -> FU (highest flag set)": {
             r: t[r] for r in order if r in t
@@ -1203,7 +1267,7 @@ def stratified(strata, cont, binary):
             continue
         groups = groups.map(key)
         out[sname] = {
-            "group sizes": levels(groups),
+            "group sizes": levels(groups, allow_text=True),
             "binary outcomes (% events)": {
                 o: {g: frac(y[groups == g])["pct"] for g in sorted(groups.unique())}
                 for o, y in binary.items()
@@ -1254,7 +1318,7 @@ def feasibility(binary, cont, B):
         minority = min(k, n - k)
         rows[o] = {
             "n": count(n),
-            "events": count(k),
+            "events": count_of(k, n),
             "pct": pct(k, n),
             "max predictors at 10 EPV": minority // 10 if minority >= MIN_CELL else 0,
             "max predictors at 20 EPV": minority // 20 if minority >= MIN_CELL else 0,
@@ -1273,7 +1337,9 @@ def feasibility(binary, cont, B):
             "predictors absent": ", ".join(p for p in PREDICTORS if p not in B)
             or "none",
             "complete cases on all present predictors": count(complete.sum()),
-            "missing per predictor": {p: count(B[p].isna().sum()) for p in present},
+            "missing per predictor": {
+                p: count_of(B[p].isna().sum(), len(B)) for p in present
+            },
         },
     }
 
