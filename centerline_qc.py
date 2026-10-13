@@ -1886,15 +1886,28 @@ def write_report(out, src, cases, items, df, seg, lv, errors, metas, codes=None)
             f"cases with any unlabelled length: {(df['unlabelled_mm'] > 0).sum()} of {n}.",
             "",
         ]
+        ct = pd.DataFrame(
+            {
+                "all cases": df["n_components"].value_counts(),
+                "complete trunks": df.loc[
+                    df["complete_trunks"], "n_components"
+                ].value_counts(),
+                "complete trunks, pieces < 10 mm ignored": (
+                    df["n_components"] - df["n_tiny_components"]
+                )[df["complete_trunks"]].value_counts(),
+            }
+        )
         R += [
-            "Connected components per case (expect 2: left and right tree):",
+            "Connected components (separate pieces) per case - expect 2: left and right tree. In complete-trunk "
+            "cases the LAD/CX trunks are one piece and the RCA trunk another, so extra pieces are side branches "
+            "or fragments:",
             "",
             md_table(
-                df["n_components"]
-                .value_counts()
+                ct.fillna(0)
+                .astype(int)
                 .sort_index()
                 .rename_axis("components")
-                .reset_index(name="cases")
+                .reset_index()
             ),
             "",
         ]
