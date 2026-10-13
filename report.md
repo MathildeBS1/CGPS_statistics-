@@ -124,16 +124,16 @@ Units: total lengths of ~200-800 mm and extents of ~50-150 mm mean mm; much smal
 
 Unlabelled length over all cases: 109218 of 513515 mm (**21.3 %**); cases with any unlabelled length: 736 of 744.
 
-Connected components per case (expect 2: left and right tree):
+Connected components (separate pieces) per case - expect 2: left and right tree. In complete-trunk cases the LAD/CX trunks are one piece and the RCA trunk another, so extra pieces are side branches or fragments:
 
-| components | cases |
-|---|---|
-| 1 | 9 |
-| 2 | 339 |
-| 3 | 244 |
-| 4 | 118 |
-| 5 | 28 |
-| 6 | 6 |
+| components | all cases | complete trunks | complete trunks, pieces < 10 mm ignored |
+|---|---|---|---|
+| 1 | 9 | 0 | 0 |
+| 2 | 339 | 155 | 226 |
+| 3 | 244 | 130 | 114 |
+| 4 | 118 | 64 | 24 |
+| 5 | 28 | 12 | 2 |
+| 6 | 6 | 5 | 0 |
 
 ## Segments: presence and length (mm)
 
@@ -168,6 +168,21 @@ Whole arteries present (any of their segments):
 - LAD: 702 of 744 (94.4 %)
 - CX: 707 of 744 (95.0 %)
 - RCA: 735 of 744 (98.8 %)
+
+## Complete main trunks (not dominance-dependent)
+
+A trunk is complete when all its segments are present and each is joined to the one before it (directly or through unlabelled points). PDA/PLB are left out as they depend on dominance; dRCA can be small in left-dominant hearts, so RCA is also shown without it.
+
+| trunk | complete cases | % of cases |
+|---|---|---|
+| LM + LAD (LM, pLAD, mLAD, dLAD) | 576 | 77.4 |
+| LM + CX (LM, pCx, LCx) | 581 | 78.1 |
+| RCA (pRCA, mRCA, dRCA) | 553 | 74.3 |
+| RCA without dRCA (pRCA, mRCA) | 567 | 76.2 |
+| All three (LAD, CX, RCA incl. dRCA) | 366 | 49.2 |
+| All three, RCA without dRCA | 373 | 50.1 |
+
+**Complete trunks** (all three, incl. dRCA; set by COMPLETE_RCA_NEEDS_DRCA): 366 of 744. Case IDs: `complete_trunks.txt`; per trunk: `complete_LAD.txt`, `complete_CX.txt`, `complete_RCA.txt`, `complete_RCA_no_dRCA.txt`. Figures: `figures/all/` (all centerlines) and `figures/complete_trunks/`.
 
 ## Expected connections
 
@@ -248,4 +263,4 @@ Cases without any flag: 45 of 744.
 
 Flag meanings: `no_LM/LAD/CX/RCA` = artery missing (a missing LM can be real - separate ostia - but check); `unlabelled>20%`; `>2_components` = fragments; `left_and_right_in_one_tree` = left and right trees joined (should be separate); `impossible_contact` = e.g. LAD touching RCA; `disconnected_segment` = an expected connection is missing; `segment<2mm`; `gaps_in_polyline` = jump inside one polyline; `unknown_labels` = labels not mapped (see label table); `overlapping_polylines` = > 20 % of length runs on top of another polyline.
 
-Figures: `figures/segment_lengths.png`, `segment_presence.png`, `unlabelled_pct.png`, `branch_points.png`, `total_length.png`, `components.png`.
+Figures in `figures/all/` and `figures/complete_trunks/`: `segment_lengths.png`, `segment_presence.png`, `unlabelled_pct.png`, `branch_points.png`, `total_length.png`, `components.png`.
