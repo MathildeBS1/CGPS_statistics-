@@ -1744,6 +1744,12 @@ def main():
         sub_df = df[df["complete_trunks"]]
         if len(sub_df):
             plots(sub_df, seg, out, "complete_trunks", "Complete trunks only")
+        else:
+            print(
+                "no case has all three trunks complete - figures/complete_trunks/ not made "
+                "(see the 'Complete main trunks' table in report.md)"
+            )
+        print(f"complete trunks: {len(sub_df)} of {len(df)} cases")
 
     codes = pd.DataFrame(
         [
