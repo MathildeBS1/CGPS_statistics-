@@ -73,6 +73,8 @@ OVERLAP_TOL = (
 )
 SHORT_SEGMENT = 2.0  # mm: labelled segments shorter than this are flagged
 LABEL_NUMBERING = "auto"  # "auto", "scct" (numbers are SCCT 18-segment codes) or "raw"
+CODE_NAMES = {}  # names for label codes no file names, once Kit confirms them, e.g. {18: "D3", 22: "OM2"}
+COMPLETE_RCA_NEEDS_DRCA = True  # complete_trunks: LAD, CX and RCA trunks all complete; False = RCA only needs pRCA + mRCA
 CASE_FROM = (
     "auto"  # "auto", "folder" (first folder under the common root = case) or "file"
 )
@@ -1487,7 +1489,76 @@ def inventory(src, cases, mode, root):
     return "\n".join(lines)
 
 
-def plots(df, seg, out):
+TRUNKS = {  # dominance-independent trunks; segments in order, each joined to the one before it
+    "LAD": ["LM", "pLAD", "mLAD", "dLAD"],
+    "CX": ["LM", "pCX", "CX"],
+    "RCA": ["pRCA", "mRCA", "dRCA"],
+    "RCA_no_dRCA": ["pRCA", "mRCA"],
+}
+
+
+def complete_trunks(df, seg):
+    """Boolean columns complete_<trunk> and complete_trunks, one value per case (rows of df)."""
+    n = len(df)
+    s = seg.reindex(df["case"]).fillna(0)
+    ok = lambda x: (s[x] > 0).to_numpy() if x in s.columns else np.zeros(n, bool)
+    joined = lambda x: (
+        df[f"conn_{x}"].isin(["direct", "via_unlabelled"]).to_numpy()
+        if f"conn_{x}" in df
+        else np.zeros(n, bool)
+    )
+    out = {
+        f"complete_{k}": np.logical_and.reduce(
+            [ok(x) for x in v] + [joined(x) for x in v[1:]]
+        )
+        for k, v in TRUNKS.items()
+    }
+    rca = (
+        out["complete_RCA"] if COMPLETE_RCA_NEEDS_DRCA else out["complete_RCA_no_dRCA"]
+    )
+    out["complete_trunks"] = out["complete_LAD"] & out["complete_CX"] & rca
+    return pd.DataFrame(out, index=df.index)
+
+
+def write_id_lists(df, out):
+    """complete_trunks.txt (all three trunks complete) and one list per trunk, one case ID per line."""
+    rca_rule = (
+        "pRCA -> mRCA -> dRCA"
+        if COMPLETE_RCA_NEEDS_DRCA
+        else "pRCA -> mRCA (dRCA not required)"
+    )
+    lists = {
+        "complete_trunks.txt": (
+            "complete_trunks",
+            "LAD, CX and RCA trunks all complete: LM -> pLAD -> mLAD -> dLAD, "
+            f"LM -> pCx -> LCx, {rca_rule}",
+        ),
+        "complete_LAD.txt": (
+            "complete_LAD",
+            "LAD trunk complete: LM -> pLAD -> mLAD -> dLAD",
+        ),
+        "complete_CX.txt": ("complete_CX", "CX trunk complete: LM -> pCx -> LCx"),
+        "complete_RCA.txt": (
+            "complete_RCA",
+            "RCA trunk complete: pRCA -> mRCA -> dRCA",
+        ),
+        "complete_RCA_no_dRCA.txt": (
+            "complete_RCA_no_dRCA",
+            "RCA trunk complete without dRCA: pRCA -> mRCA",
+        ),
+    }
+    for fn, (col, rule) in lists.items():
+        ids = df.loc[df[col], "case"].astype(str).tolist()
+        head = [
+            f"# {rule}",
+            "# complete = every segment present and joined to the one before it (directly or via unlabelled points)",
+            f"# {len(ids)} of {len(df)} cases",
+            "",
+        ]
+        (out / fn).write_text("\n".join(head + ids) + "\n", encoding="utf-8")
+
+
+def plots(df, seg, out, sub="all", title=""):
     try:
         import matplotlib
 
@@ -1496,8 +1567,10 @@ def plots(df, seg, out):
     except ImportError:
         print("matplotlib not available - skipping figures")
         return
-    fig_dir = out / "figures"
-    fig_dir.mkdir(exist_ok=True)
+    fig_dir = out / "figures" / sub
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    seg = seg.reindex(df["case"]).fillna(0)
+    title = f"{title} (n = {len(df)} cases)"
     blue = "#2a6fb0"
     present = [s for s in SEGMENTS if s in seg.columns and seg[s].gt(0).any()]
     others = sorted(c for c in seg.columns if c not in SEGMENTS)
@@ -1516,6 +1589,7 @@ def plots(df, seg, out):
             ax.spines[["top", "right"]].set_visible(False)
         for ax in axes.ravel()[n:]:
             ax.axis("off")
+        fig.suptitle(title, fontsize=11)
         fig.tight_layout()
         fig.savefig(fig_dir / "segment_lengths.png", dpi=130)
         plt.close(fig)
@@ -1526,6 +1600,7 @@ def plots(df, seg, out):
         ax.set_xticks(range(len(cols)), cols, rotation=60, fontsize=7, ha="right")
         ax.set_ylabel("% of cases with segment")
         ax.set_ylim(0, 100)
+        ax.set_title(title, fontsize=10)
         ax.spines[["top", "right"]].set_visible(False)
         fig.tight_layout()
         fig.savefig(fig_dir / "segment_presence.png", dpi=130)
@@ -1550,6 +1625,7 @@ def plots(df, seg, out):
         ax.hist(x, bins=bins, color=blue, edgecolor="white", linewidth=0.5)
         ax.set_xlabel(xl)
         ax.set_ylabel("cases")
+        ax.set_title(title, fontsize=10)
         ax.spines[["top", "right"]].set_visible(False)
         fig.tight_layout()
         fig.savefig(fig_dir / f"{fn}.png", dpi=130)
@@ -1622,6 +1698,7 @@ def main():
     ) in code_use.items():  # most common name per code, over the files that name it
         if u["names"]:
             _code_names[c] = u["names"].most_common(1)[0][0]
+    _code_names.update(CODE_NAMES)
     rows, seg_rows = [], []
     for k, (cid, polys) in enumerate(parsed.items(), 1):
         try:
@@ -1649,6 +1726,9 @@ def main():
         .reindex(df["case"] if len(df) else [])
         .fillna(0)
     )
+    if len(df):
+        df = pd.concat([df, complete_trunks(df, seg)], axis=1)
+        write_id_lists(df, out)
     df.to_csv(out / "per_case.csv", index=False)
     seg_long.to_csv(out / "segment_lengths.csv", index=False)
     lv = pd.DataFrame(
@@ -1660,7 +1740,10 @@ def main():
     )
     lv.to_csv(out / "label_values.csv", index=False)
     if len(df):
-        plots(df, seg, out)
+        plots(df, seg, out, "all", "All centerlines")
+        sub_df = df[df["complete_trunks"]]
+        if len(sub_df):
+            plots(sub_df, seg, out, "complete_trunks", "Complete trunks only")
 
     codes = pd.DataFrame(
         [
@@ -1838,6 +1921,48 @@ def write_report(out, src, cases, items, df, seg, lv, errors, metas, codes=None)
         ]
         R += [
             "",
+            "## Complete main trunks (not dominance-dependent)",
+            "",
+            "A trunk is complete when all its segments are present and each is joined to the one "
+            "before it (directly or through unlabelled points). PDA/PLB are left out as they depend "
+            "on dominance; dRCA can be small in left-dominant hearts, so RCA is also shown without it.",
+            "",
+        ]
+        rows_ = [
+            ("LM + LAD (LM, pLAD, mLAD, dLAD)", df["complete_LAD"]),
+            ("LM + CX (LM, pCx, LCx)", df["complete_CX"]),
+            ("RCA (pRCA, mRCA, dRCA)", df["complete_RCA"]),
+            ("RCA without dRCA (pRCA, mRCA)", df["complete_RCA_no_dRCA"]),
+            (
+                "All three (LAD, CX, RCA incl. dRCA)",
+                df["complete_LAD"] & df["complete_CX"] & df["complete_RCA"],
+            ),
+            (
+                "All three, RCA without dRCA",
+                df["complete_LAD"] & df["complete_CX"] & df["complete_RCA_no_dRCA"],
+            ),
+        ]
+        R += md_table(
+            pd.DataFrame(
+                [
+                    {
+                        "trunk": k,
+                        "complete cases": int(v.sum()),
+                        "% of cases": round(100 * v.mean(), 1),
+                    }
+                    for k, v in rows_
+                ]
+            )
+        ).splitlines()
+        rule = "incl. dRCA" if COMPLETE_RCA_NEEDS_DRCA else "RCA without dRCA"
+        R += [
+            "",
+            f"**Complete trunks** (all three, {rule}; set by COMPLETE_RCA_NEEDS_DRCA): {int(df['complete_trunks'].sum())} of {n}. "
+            "Case IDs: `complete_trunks.txt`; per trunk: `complete_LAD.txt`, `complete_CX.txt`, `complete_RCA.txt`, "
+            "`complete_RCA_no_dRCA.txt`. Figures: `figures/all/` (all centerlines) and `figures/complete_trunks/`.",
+        ]
+        R += [
+            "",
             "## Expected connections",
             "",
             "Among cases that have both the segment and one of its parents: `direct` = an edge joins "
@@ -1913,7 +2038,7 @@ def write_report(out, src, cases, items, df, seg, lv, errors, metas, codes=None)
             "",
         ]
         R += [
-            "Figures: `figures/segment_lengths.png`, `segment_presence.png`, `unlabelled_pct.png`, "
+            "Figures in `figures/all/` and `figures/complete_trunks/`: `segment_lengths.png`, `segment_presence.png`, `unlabelled_pct.png`, "
             "`branch_points.png`, `total_length.png`, `components.png`.",
             "",
         ]
