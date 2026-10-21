@@ -6,7 +6,7 @@ Uses BL_PATH / FU_PATH from cgps_stats.py unless overridden. Prints aggregate ta
 counts suppressed as in cgps_stats.py); nothing is written to disk.
 
 Developed plaque: FU ct_cag_sis > 0. A segment has plaque at FU when its decoded stenosis is minimal
-or worse. Segments are grouped into LM, the three trunks (TRUNKS in cgps_stats.py) and the side
+or worse. Segments are grouped into LM, the three trunks (TRUNKS) and the side
 branches. Tables:
 1. cohort: clean baseline, paired with FU, developed plaque;
 2. share of all FU plaque segments (and of the summed stenosis grades) in each unit;
@@ -21,8 +21,9 @@ import argparse
 
 import pandas as pd
 
-from cgps_stats import BL_PATH, FU_PATH, SEGMENTS, TRUNKS, count, decode_segments, load, num, pct
+from cgps_stats import BL_PATH, FU_PATH, SEGMENTS, count, decode_segments, load, num, pct
 
+TRUNKS = {"LAD": ("plad", "mlad", "dlad"), "CX": ("pcx", "mcx", "dcx"), "RCA": ("prca", "mrca", "drca")}
 SIDE_BRANCHES = ("d1", "d2", "im", "om1", "om2", "pda", "pla")
 UNITS = {"LM": ("lm",), **{f"{v} trunk": segs for v, segs in TRUNKS.items()},
          **{s.upper(): (s,) for s in SIDE_BRANCHES}}
